@@ -75,19 +75,24 @@ func main() {
 	go func() {
 		ticker := time.NewTicker(5 * time.Second)
 		defer ticker.Stop()
+		var lastHeight int32
 		for range ticker.C {
 			best, err := cs.BestBlock()
 			if err != nil {
 				continue
 			}
+			if best.Height == lastHeight {
+				continue
+			}
+			lastHeight = best.Height
 			if cs.IsCurrent() {
 				log.Printf("Synced to block %d (%s)",
 					best.Height, best.Hash)
-				return
+			} else {
+				log.Printf("Syncing... block %d (%s)",
+					best.Height,
+					best.Timestamp.Format("2006-01-02 15:04:05"))
 			}
-			log.Printf("Syncing... block %d (%s)",
-				best.Height,
-				best.Timestamp.Format("2006-01-02 15:04:05"))
 		}
 	}()
 
