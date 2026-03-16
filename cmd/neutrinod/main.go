@@ -14,10 +14,12 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/btcsuite/btcd/chaincfg"
+	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcwallet/walletdb"
 	_ "github.com/btcsuite/btcwallet/walletdb/bdb"
@@ -197,6 +199,10 @@ func (h *rpcHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		result, rpcErr = h.handleGetBlockHash(req.Params)
 	case "getblockheader":
 		result, rpcErr = h.handleGetBlockHeader(req.Params)
+	case "getpeerinfo":
+		result, rpcErr = h.handleGetPeerInfo()
+	case "addnode":
+		result, rpcErr = h.handleAddNode(req.Params)
 	default:
 		rpcErr = &rpcError{
 			Code:    -32601,
@@ -329,6 +335,141 @@ func (h *rpcHandler) handleGetBlockHeader(params []json.RawMessage) (any, *rpcEr
 	}
 
 	return result, nil
+}
+
+// peerInfoResult matches Bitcoin Core's getpeerinfo response for a single peer.
+type peerInfoResult struct {
+	ID             int32   `json:"id"`
+	Addr           string  `json:"addr"`
+	Services       string  `json:"services"`
+	ServicesNames  string  `json:"servicesnames"`
+	LastSend       int64   `json:"lastsend"`
+	LastRecv       int64   `json:"lastrecv"`
+	BytesSent      uint64  `json:"bytessent"`
+	BytesRecv      uint64  `json:"bytesrecv"`
+	ConnTime       int64   `json:"conntime"`
+	TimeOffset     int64   `json:"timeoffset"`
+	PingTime       float64 `json:"pingtime"`
+	Version        uint32  `json:"version"`
+	SubVer         string  `json:"subver"`
+	Inbound        bool    `json:"inbound"`
+	StartingHeight int32   `json:"startingheight"`
+	SyncdHeaders   int32   `json:"synced_headers"`
+}
+
+// handleGetPeerInfo implements the getpeerinfo RPC.
+func (h *rpcHandler) handleGetPeerInfo() (any, *rpcError) {
+	peers := h.cs.Peers()
+	result := make([]peerInfoResult, 0, len(peers))
+
+	for _, p := range peers {
+		stats := p.StatsSnapshot()
+
+		services := fmt.Sprintf("%016x", uint64(stats.Services))
+		servicesNames := servicesFlagString(stats.Services)
+
+		var pingTime float64
+		if stats.LastPingMicros > 0 {
+			pingTime = float64(stats.LastPingMicros) / 1e6
+		}
+
+		result = append(result, peerInfoResult{
+			ID:             stats.ID,
+			Addr:           stats.Addr,
+			Services:       services,
+			ServicesNames:  servicesNames,
+			LastSend:       stats.LastSend.Unix(),
+			LastRecv:       stats.LastRecv.Unix(),
+			BytesSent:      stats.BytesSent,
+			BytesRecv:      stats.BytesRecv,
+			ConnTime:       stats.ConnTime.Unix(),
+			TimeOffset:     stats.TimeOffset,
+			PingTime:       pingTime,
+			Version:        stats.Version,
+			SubVer:         stats.UserAgent,
+			Inbound:        stats.Inbound,
+			StartingHeight: stats.StartingHeight,
+			SyncdHeaders:   stats.LastBlock,
+		})
+	}
+
+	return result, nil
+}
+
+// handleAddNode implements the addnode RPC.
+// Params: [node, command]
+// command is one of "add", "remove", or "onetry".
+func (h *rpcHandler) handleAddNode(params []json.RawMessage) (any, *rpcError) {
+	if len(params) < 2 {
+		return nil, &rpcError{
+			Code:    -1,
+			Message: "addnode requires 2 parameters: node and command (add, remove, onetry)",
+		}
+	}
+
+	var node, command string
+	if err := json.Unmarshal(params[0], &node); err != nil {
+		return nil, &rpcError{Code: -1, Message: "invalid node parameter"}
+	}
+	if err := json.Unmarshal(params[1], &command); err != nil {
+		return nil, &rpcError{Code: -1, Message: "invalid command parameter"}
+	}
+
+	switch command {
+	case "add":
+		err := h.cs.ConnectNode(node, true)
+		if err != nil {
+			return nil, &rpcError{
+				Code:    -23,
+				Message: fmt.Sprintf("Node already added: %s", node),
+			}
+		}
+	case "remove":
+		err := h.cs.RemoveNodeByAddr(node)
+		if err != nil {
+			return nil, &rpcError{
+				Code:    -24,
+				Message: fmt.Sprintf("Node not found: %s", node),
+			}
+		}
+	case "onetry":
+		err := h.cs.ConnectNode(node, false)
+		if err != nil {
+			return nil, &rpcError{
+				Code:    -23,
+				Message: fmt.Sprintf("Failed to connect: %s", node),
+			}
+		}
+	default:
+		return nil, &rpcError{
+			Code:    -1,
+			Message: fmt.Sprintf("Invalid command: %s (use add, remove, or onetry)", command),
+		}
+	}
+
+	return nil, nil
+}
+
+// servicesFlagString returns a human-readable string for service flags,
+// matching Bitcoin Core's servicesnames format.
+func servicesFlagString(services wire.ServiceFlag) string {
+	var names []string
+	if services&wire.SFNodeNetwork != 0 {
+		names = append(names, "NETWORK")
+	}
+	if services&wire.SFNodeWitness != 0 {
+		names = append(names, "WITNESS")
+	}
+	if services&wire.SFNodeCF != 0 {
+		names = append(names, "COMPACT_FILTERS")
+	}
+	if services&wire.SFNodeBloom != 0 {
+		names = append(names, "BLOOM")
+	}
+	if services&wire.SFNodeNetworkLimited != 0 {
+		names = append(names, "NETWORK_LIMITED")
+	}
+	return strings.Join(names, " & ")
 }
 
 // difficultyFromBits converts the compact "bits" representation to difficulty.
