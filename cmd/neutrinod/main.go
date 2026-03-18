@@ -15,12 +15,14 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
+	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/chaincfg"
-	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
+	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcwallet/walletdb"
 	_ "github.com/btcsuite/btcwallet/walletdb/bdb"
 	"github.com/lightninglabs/neutrino"
@@ -29,7 +31,7 @@ import (
 func main() {
 	var (
 		dataDir  = flag.String("datadir", defaultDataDir(), "data directory")
-		network  = flag.String("network", "mainnet", "bitcoin network (mainnet, testnet3, regtest, simnet)")
+		network  = flag.String("network", "mainnet", "bitcoin network (mainnet, testnet3, testnet4, signet, regtest, simnet)")
 		listen   = flag.String("rpcbind", "127.0.0.1:8332", "RPC listen address")
 		addPeers stringSlice
 	)
@@ -97,15 +99,39 @@ func main() {
 	}()
 
 	go func() {
-		ticker := time.NewTicker(30 * time.Second)
+		ticker := time.NewTicker(5 * time.Second)
 		defer ticker.Stop()
+		known := make(map[int32]string) // peer ID -> addr
+		var tickCount int
 		for range ticker.C {
-			log.Printf("Connected peers: %d",
-				cs.ConnectedCount())
+			peers := cs.Peers()
+			current := make(map[int32]string, len(peers))
+			for _, p := range peers {
+				snap := p.StatsSnapshot()
+				current[snap.ID] = snap.Addr
+			}
+			for id, addr := range current {
+				if _, ok := known[id]; !ok {
+					log.Printf("Peer connected: %s", addr)
+				}
+			}
+			for id, addr := range known {
+				if _, ok := current[id]; !ok {
+					log.Printf("Peer disconnected: %s", addr)
+				}
+			}
+			known = current
+			tickCount++
+			if tickCount%6 == 0 {
+				log.Printf("Connected peers: %d", len(current))
+			}
 		}
 	}()
 
-	handler := &rpcHandler{cs: cs}
+	cache := newRecentBlocksCache()
+	go runBlockFetcher(ctx, cs, cache)
+
+	handler := &rpcHandler{cs: cs, cache: cache}
 	srv := &http.Server{
 		Addr:    *listen,
 		Handler: handler,
@@ -136,6 +162,10 @@ func networkParams(network string) (*chaincfg.Params, error) {
 		return &chaincfg.MainNetParams, nil
 	case "testnet3":
 		return &chaincfg.TestNet3Params, nil
+	case "testnet4":
+		return &chaincfg.TestNet4Params, nil
+	case "signet":
+		return &chaincfg.SigNetParams, nil
 	case "regtest":
 		return &chaincfg.RegressionNetParams, nil
 	case "simnet":
@@ -152,6 +182,142 @@ func (s *stringSlice) String() string { return fmt.Sprintf("%v", *s) }
 func (s *stringSlice) Set(val string) error {
 	*s = append(*s, val)
 	return nil
+}
+
+const recentBlockCount = 20
+
+// recentBlocksCache keeps the full block data for the most recent blocks
+// in memory so they can be served via the getblock RPC.
+type recentBlocksCache struct {
+	mu     sync.RWMutex
+	blocks map[chainhash.Hash]*btcutil.Block // hash -> block
+	byHeight map[int32]*btcutil.Block        // height -> block
+	tipHeight int32
+}
+
+func newRecentBlocksCache() *recentBlocksCache {
+	return &recentBlocksCache{
+		blocks:   make(map[chainhash.Hash]*btcutil.Block),
+		byHeight: make(map[int32]*btcutil.Block),
+	}
+}
+
+// add inserts a block and evicts any block older than recentBlockCount from tip.
+func (c *recentBlocksCache) add(block *btcutil.Block) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	height := block.Height()
+	hash := block.Hash()
+
+	c.blocks[*hash] = block
+	c.byHeight[height] = block
+
+	if height > c.tipHeight {
+		c.tipHeight = height
+	}
+
+	// Evict blocks outside the window.
+	cutoff := c.tipHeight - recentBlockCount
+	for h, b := range c.byHeight {
+		if h <= cutoff {
+			delete(c.blocks, *b.Hash())
+			delete(c.byHeight, h)
+		}
+	}
+}
+
+// get returns the block for the given hash, or nil if not cached.
+func (c *recentBlocksCache) get(hash *chainhash.Hash) *btcutil.Block {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.blocks[*hash]
+}
+
+// getByHeight returns the block at the given height, or nil if not cached.
+func (c *recentBlocksCache) getByHeight(height int32) *btcutil.Block {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.byHeight[height]
+}
+
+// handleReorg removes all blocks above the given height (used on reorg).
+func (c *recentBlocksCache) handleReorg(newTipHeight int32) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	for h, b := range c.byHeight {
+		if h > newTipHeight {
+			delete(c.blocks, *b.Hash())
+			delete(c.byHeight, h)
+		}
+	}
+	c.tipHeight = newTipHeight
+}
+
+// runBlockFetcher polls for new tip blocks and fetches full blocks for the
+// latest recentBlockCount blocks.
+func runBlockFetcher(ctx context.Context, cs *neutrino.ChainService, cache *recentBlocksCache) {
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	var lastTip int32
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+
+		if !cs.IsCurrent() {
+			continue
+		}
+
+		best, err := cs.BestBlock()
+		if err != nil || best.Height == lastTip {
+			continue
+		}
+
+		if best.Height < lastTip {
+			// Reorg detected.
+			cache.handleReorg(best.Height)
+		}
+
+		// Fetch blocks from lastTip+1 to best.Height (bounded to
+		// recentBlockCount from the tip).
+		startHeight := lastTip + 1
+		minHeight := best.Height - recentBlockCount + 1
+		if minHeight < 0 {
+			minHeight = 0
+		}
+		if startHeight < minHeight {
+			startHeight = minHeight
+		}
+
+		for h := startHeight; h <= best.Height; h++ {
+			if cache.getByHeight(h) != nil {
+				continue
+			}
+
+			hash, err := cs.GetBlockHash(int64(h))
+			if err != nil {
+				log.Printf("Failed to get block hash at height %d: %v", h, err)
+				break
+			}
+
+			block, err := cs.GetBlock(*hash)
+			if err != nil {
+				log.Printf("Failed to fetch block %d (%s): %v", h, hash, err)
+				break
+			}
+			block.SetHeight(h)
+			cache.add(block)
+			log.Printf("Fetched block %d (%s)", h, hash)
+		}
+
+		lastTip = best.Height
+	}
 }
 
 // JSON-RPC types.
@@ -176,7 +342,8 @@ type rpcError struct {
 }
 
 type rpcHandler struct {
-	cs *neutrino.ChainService
+	cs    *neutrino.ChainService
+	cache *recentBlocksCache
 }
 
 func (h *rpcHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -200,8 +367,12 @@ func (h *rpcHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	)
 
 	switch req.Method {
+	case "getbestblockhash":
+		result, rpcErr = h.handleGetBestBlockHash()
 	case "getblockhash":
 		result, rpcErr = h.handleGetBlockHash(req.Params)
+	case "getblock":
+		result, rpcErr = h.handleGetBlock(req.Params)
 	case "getblockheader":
 		result, rpcErr = h.handleGetBlockHeader(req.Params)
 	case "getpeerinfo":
@@ -242,6 +413,133 @@ func (h *rpcHandler) handleGetBlockHash(params []json.RawMessage) (any, *rpcErro
 	}
 
 	return hash.String(), nil
+}
+
+// handleGetBestBlockHash implements the getbestblockhash RPC.
+func (h *rpcHandler) handleGetBestBlockHash() (any, *rpcError) {
+	best, err := h.cs.BestBlock()
+	if err != nil {
+		return nil, &rpcError{Code: -1, Message: "failed to get best block"}
+	}
+	return best.Hash.String(), nil
+}
+
+// getBlockVerboseResult matches Bitcoin Core's verbose getblock response (verbosity=1).
+type getBlockVerboseResult struct {
+	Hash          string   `json:"hash"`
+	Confirmations int32    `json:"confirmations"`
+	Size          int      `json:"size"`
+	StrippedSize  int      `json:"strippedsize"`
+	Weight        int      `json:"weight"`
+	Height        int32    `json:"height"`
+	Version       int32    `json:"version"`
+	VersionHex    string   `json:"versionHex"`
+	MerkleRoot    string   `json:"merkleroot"`
+	Tx            []string `json:"tx"`
+	Time          int64    `json:"time"`
+	MedianTime    int64    `json:"mediantime"`
+	Nonce         uint32   `json:"nonce"`
+	Bits          string   `json:"bits"`
+	Difficulty    float64  `json:"difficulty"`
+	NTx           int      `json:"nTx"`
+	PreviousHash  string   `json:"previousblockhash,omitempty"`
+	NextHash      string   `json:"nextblockhash,omitempty"`
+}
+
+// handleGetBlock implements the getblock RPC.
+// Params: [hash, verbosity=1]
+// verbosity 0: hex-encoded serialized block
+// verbosity 1: JSON object with tx hashes
+// Only blocks in the recent cache (latest 20) are available.
+func (h *rpcHandler) handleGetBlock(params []json.RawMessage) (any, *rpcError) {
+	if len(params) < 1 {
+		return nil, &rpcError{Code: -1, Message: "getblock requires 1 parameter"}
+	}
+
+	var hashStr string
+	if err := json.Unmarshal(params[0], &hashStr); err != nil {
+		return nil, &rpcError{Code: -1, Message: "invalid hash parameter"}
+	}
+
+	hash, err := chainhash.NewHashFromStr(hashStr)
+	if err != nil {
+		return nil, &rpcError{Code: -1, Message: "invalid block hash"}
+	}
+
+	verbosity := 1
+	if len(params) >= 2 {
+		if err := json.Unmarshal(params[1], &verbosity); err != nil {
+			return nil, &rpcError{Code: -1, Message: "invalid verbosity parameter"}
+		}
+	}
+
+	block := h.cache.get(hash)
+	if block == nil {
+		return nil, &rpcError{Code: -1, Message: "Block not found (only recent blocks are available)"}
+	}
+
+	msgBlock := block.MsgBlock()
+
+	if verbosity == 0 {
+		var buf bytes.Buffer
+		if err := msgBlock.Serialize(&buf); err != nil {
+			return nil, &rpcError{Code: -1, Message: "failed to serialize block"}
+		}
+		return hex.EncodeToString(buf.Bytes()), nil
+	}
+
+	best, err := h.cs.BestBlock()
+	if err != nil {
+		return nil, &rpcError{Code: -1, Message: "failed to get best block"}
+	}
+
+	height := block.Height()
+	confirmations := best.Height - height + 1
+	if confirmations < 0 {
+		confirmations = 0
+	}
+
+	txHashes := make([]string, len(msgBlock.Transactions))
+	for i, tx := range msgBlock.Transactions {
+		txHashes[i] = tx.TxHash().String()
+	}
+
+	header := &msgBlock.Header
+
+	result := getBlockVerboseResult{
+		Hash:          hash.String(),
+		Confirmations: confirmations,
+		Size:          msgBlock.SerializeSize(),
+		StrippedSize:  msgBlock.SerializeSizeStripped(),
+		Weight:        msgBlock.SerializeSizeStripped()*3 + msgBlock.SerializeSize(),
+		Height:        height,
+		Version:       header.Version,
+		VersionHex:    fmt.Sprintf("%08x", header.Version),
+		MerkleRoot:    header.MerkleRoot.String(),
+		Tx:            txHashes,
+		Time:          header.Timestamp.Unix(),
+		MedianTime:    header.Timestamp.Unix(),
+		Nonce:         header.Nonce,
+		Bits:          fmt.Sprintf("%08x", header.Bits),
+		Difficulty:    difficultyFromBits(header.Bits),
+		NTx:           len(msgBlock.Transactions),
+	}
+
+	if header.PrevBlock != (chainhash.Hash{}) {
+		result.PreviousHash = header.PrevBlock.String()
+	}
+
+	// Attempt to find the next block header.
+	nextHeight := uint32(height) + 1
+	if nextHeight <= uint32(best.Height) {
+		nextHeader, err := h.cs.BlockHeaders.FetchHeaderByHeight(nextHeight)
+		if err == nil {
+			nextHash := nextHeader.BlockHash()
+			result.NextHash = nextHash.String()
+		}
+	}
+
+	return result, nil
 }
 
 // getBlockHeaderVerboseResult matches Bitcoin Core's verbose getblockheader response.
@@ -310,6 +608,11 @@ func (h *rpcHandler) handleGetBlockHeader(params []json.RawMessage) (any, *rpcEr
 		confirmations = 0
 	}
 
+	var nTx int32
+	if cached := h.cache.get(hash); cached != nil {
+		nTx = int32(len(cached.MsgBlock().Transactions))
+	}
+
 	result := getBlockHeaderVerboseResult{
 		Hash:          hash.String(),
 		Confirmations: confirmations,
@@ -322,7 +625,7 @@ func (h *rpcHandler) handleGetBlockHeader(params []json.RawMessage) (any, *rpcEr
 		Nonce:         header.Nonce,
 		Bits:          fmt.Sprintf("%08x", header.Bits),
 		Difficulty:    difficultyFromBits(header.Bits),
-		NTx:           0,
+		NTx:           nTx,
 	}
 
 	if header.PrevBlock != (chainhash.Hash{}) {
