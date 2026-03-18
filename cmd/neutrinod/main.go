@@ -30,10 +30,11 @@ import (
 
 func main() {
 	var (
-		dataDir  = flag.String("datadir", defaultDataDir(), "data directory")
-		network  = flag.String("network", "mainnet", "bitcoin network (mainnet, testnet3, testnet4, signet, regtest, simnet)")
-		listen   = flag.String("rpcbind", "127.0.0.1:8332", "RPC listen address")
-		addPeers stringSlice
+		dataDir    = flag.String("datadir", defaultDataDir(), "data directory")
+		network    = flag.String("network", "mainnet", "bitcoin network (mainnet, testnet3, testnet4, signet, regtest, simnet)")
+		listen     = flag.String("rpcbind", "127.0.0.1:8332", "RPC listen address")
+		cacheBlocks = flag.Int("cacheblocks", 20, "number of recent blocks to keep in memory")
+		addPeers   stringSlice
 	)
 	flag.Var(&addPeers, "addpeer", "add a peer to connect to (can be specified multiple times)")
 	flag.Parse()
@@ -128,7 +129,7 @@ func main() {
 		}
 	}()
 
-	cache := newRecentBlocksCache()
+	cache := newRecentBlocksCache(int32(*cacheBlocks))
 	go runBlockFetcher(ctx, cs, cache)
 
 	handler := &rpcHandler{cs: cs, cache: cache}
@@ -184,25 +185,33 @@ func (s *stringSlice) Set(val string) error {
 	return nil
 }
 
-const recentBlockCount = 20
-
-// recentBlocksCache keeps the full block data for the most recent blocks
-// in memory so they can be served via the getblock RPC.
-type recentBlocksCache struct {
-	mu     sync.RWMutex
-	blocks map[chainhash.Hash]*btcutil.Block // hash -> block
-	byHeight map[int32]*btcutil.Block        // height -> block
-	tipHeight int32
+// txEntry records the location of a transaction within a cached block.
+type txEntry struct {
+	blockHash chainhash.Hash
+	txIndex   int
 }
 
-func newRecentBlocksCache() *recentBlocksCache {
+// recentBlocksCache keeps the full block data for the most recent blocks
+// in memory so they can be served via the getblock and getrawtransaction RPCs.
+type recentBlocksCache struct {
+	mu        sync.RWMutex
+	blocks    map[chainhash.Hash]*btcutil.Block // block hash -> block
+	byHeight  map[int32]*btcutil.Block          // height -> block
+	txIndex   map[chainhash.Hash]txEntry         // txid -> block location
+	tipHeight int32
+	maxBlocks int32
+}
+
+func newRecentBlocksCache(maxBlocks int32) *recentBlocksCache {
 	return &recentBlocksCache{
-		blocks:   make(map[chainhash.Hash]*btcutil.Block),
-		byHeight: make(map[int32]*btcutil.Block),
+		blocks:    make(map[chainhash.Hash]*btcutil.Block),
+		byHeight:  make(map[int32]*btcutil.Block),
+		txIndex:   make(map[chainhash.Hash]txEntry),
+		maxBlocks: maxBlocks,
 	}
 }
 
-// add inserts a block and evicts any block older than recentBlockCount from tip.
+// add inserts a block and evicts any block older than maxBlocks from tip.
 func (c *recentBlocksCache) add(block *btcutil.Block) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -213,14 +222,23 @@ func (c *recentBlocksCache) add(block *btcutil.Block) {
 	c.blocks[*hash] = block
 	c.byHeight[height] = block
 
+	// Index all transactions in this block.
+	for i, tx := range block.MsgBlock().Transactions {
+		c.txIndex[tx.TxHash()] = txEntry{blockHash: *hash, txIndex: i}
+	}
+
 	if height > c.tipHeight {
 		c.tipHeight = height
 	}
 
 	// Evict blocks outside the window.
-	cutoff := c.tipHeight - recentBlockCount
+	cutoff := c.tipHeight - c.maxBlocks
 	for h, b := range c.byHeight {
 		if h <= cutoff {
+			// Remove tx index entries for the evicted block.
+			for _, tx := range b.MsgBlock().Transactions {
+				delete(c.txIndex, tx.TxHash())
+			}
 			delete(c.blocks, *b.Hash())
 			delete(c.byHeight, h)
 		}
@@ -241,6 +259,26 @@ func (c *recentBlocksCache) getByHeight(height int32) *btcutil.Block {
 	return c.byHeight[height]
 }
 
+// getTx returns the transaction and its containing block for a given txid.
+func (c *recentBlocksCache) getTx(txid *chainhash.Hash) (*wire.MsgTx, *btcutil.Block, int) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	entry, ok := c.txIndex[*txid]
+	if !ok {
+		return nil, nil, -1
+	}
+	block, ok := c.blocks[entry.blockHash]
+	if !ok {
+		return nil, nil, -1
+	}
+	txs := block.MsgBlock().Transactions
+	if entry.txIndex >= len(txs) {
+		return nil, nil, -1
+	}
+	return txs[entry.txIndex], block, entry.txIndex
+}
+
 // handleReorg removes all blocks above the given height (used on reorg).
 func (c *recentBlocksCache) handleReorg(newTipHeight int32) {
 	c.mu.Lock()
@@ -248,6 +286,9 @@ func (c *recentBlocksCache) handleReorg(newTipHeight int32) {
 
 	for h, b := range c.byHeight {
 		if h > newTipHeight {
+			for _, tx := range b.MsgBlock().Transactions {
+				delete(c.txIndex, tx.TxHash())
+			}
 			delete(c.blocks, *b.Hash())
 			delete(c.byHeight, h)
 		}
@@ -256,7 +297,7 @@ func (c *recentBlocksCache) handleReorg(newTipHeight int32) {
 }
 
 // runBlockFetcher polls for new tip blocks and fetches full blocks for the
-// latest recentBlockCount blocks.
+// latest cached blocks.
 func runBlockFetcher(ctx context.Context, cs *neutrino.ChainService, cache *recentBlocksCache) {
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
@@ -285,9 +326,9 @@ func runBlockFetcher(ctx context.Context, cs *neutrino.ChainService, cache *rece
 		}
 
 		// Fetch blocks from lastTip+1 to best.Height (bounded to
-		// recentBlockCount from the tip).
+		// maxBlocks from the tip).
 		startHeight := lastTip + 1
-		minHeight := best.Height - recentBlockCount + 1
+		minHeight := best.Height - cache.maxBlocks + 1
 		if minHeight < 0 {
 			minHeight = 0
 		}
@@ -375,6 +416,8 @@ func (h *rpcHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		result, rpcErr = h.handleGetBlock(req.Params)
 	case "getblockheader":
 		result, rpcErr = h.handleGetBlockHeader(req.Params)
+	case "getrawtransaction":
+		result, rpcErr = h.handleGetRawTransaction(req.Params)
 	case "getpeerinfo":
 		result, rpcErr = h.handleGetPeerInfo()
 	case "addnode":
@@ -540,6 +583,204 @@ func (h *rpcHandler) handleGetBlock(params []json.RawMessage) (any, *rpcError) {
 	}
 
 	return result, nil
+}
+
+// rawTxVerboseResult matches Bitcoin Core's verbose getrawtransaction response.
+type rawTxVerboseResult struct {
+	Hex       string      `json:"hex"`
+	TxID      string      `json:"txid"`
+	Hash      string      `json:"hash"`
+	Size      int         `json:"size"`
+	VSize     int         `json:"vsize"`
+	Weight    int         `json:"weight"`
+	Version   int32       `json:"version"`
+	LockTime  uint32      `json:"locktime"`
+	Vin       []txVinResult  `json:"vin"`
+	Vout      []txVoutResult `json:"vout"`
+	BlockHash string      `json:"blockhash"`
+	Confirmations int32   `json:"confirmations"`
+	BlockTime int64       `json:"blocktime"`
+	Time      int64       `json:"time"`
+}
+
+type txVinResult struct {
+	TxID      string    `json:"txid,omitempty"`
+	Vout      uint32    `json:"vout,omitempty"`
+	ScriptSig *scriptSigResult `json:"scriptSig,omitempty"`
+	Coinbase  string    `json:"coinbase,omitempty"`
+	TxInWitness []string `json:"txinwitness,omitempty"`
+	Sequence  uint32    `json:"sequence"`
+}
+
+type scriptSigResult struct {
+	Hex string `json:"hex"`
+}
+
+type txVoutResult struct {
+	Value        float64          `json:"value"`
+	N            int              `json:"n"`
+	ScriptPubKey scriptPubKeyResult `json:"scriptPubKey"`
+}
+
+type scriptPubKeyResult struct {
+	Hex  string `json:"hex"`
+	Type string `json:"type"`
+}
+
+// handleGetRawTransaction implements the getrawtransaction RPC.
+// Params: [txid, verbose=false]
+// Searches only in cached recent blocks.
+func (h *rpcHandler) handleGetRawTransaction(params []json.RawMessage) (any, *rpcError) {
+	if len(params) < 1 {
+		return nil, &rpcError{Code: -1, Message: "getrawtransaction requires 1 parameter"}
+	}
+
+	var txidStr string
+	if err := json.Unmarshal(params[0], &txidStr); err != nil {
+		return nil, &rpcError{Code: -1, Message: "invalid txid parameter"}
+	}
+
+	txid, err := chainhash.NewHashFromStr(txidStr)
+	if err != nil {
+		return nil, &rpcError{Code: -1, Message: "invalid transaction hash"}
+	}
+
+	verbose := false
+	if len(params) >= 2 {
+		// Bitcoin Core accepts both bool and int for this parameter.
+		var verboseRaw json.RawMessage
+		verboseRaw = params[1]
+		var verboseBool bool
+		var verboseInt int
+		if json.Unmarshal(verboseRaw, &verboseBool) == nil {
+			verbose = verboseBool
+		} else if json.Unmarshal(verboseRaw, &verboseInt) == nil {
+			verbose = verboseInt != 0
+		} else {
+			return nil, &rpcError{Code: -1, Message: "invalid verbose parameter"}
+		}
+	}
+
+	tx, block, _ := h.cache.getTx(txid)
+	if tx == nil {
+		return nil, &rpcError{Code: -5, Message: "No such mempool or blockchain transaction (only recent blocks are available)"}
+	}
+
+	var buf bytes.Buffer
+	if err := tx.Serialize(&buf); err != nil {
+		return nil, &rpcError{Code: -1, Message: "failed to serialize transaction"}
+	}
+	txHex := hex.EncodeToString(buf.Bytes())
+
+	if !verbose {
+		return txHex, nil
+	}
+
+	best, err := h.cs.BestBlock()
+	if err != nil {
+		return nil, &rpcError{Code: -1, Message: "failed to get best block"}
+	}
+
+	blockHash := block.Hash()
+	blockTime := block.MsgBlock().Header.Timestamp.Unix()
+	confirmations := best.Height - block.Height() + 1
+	if confirmations < 0 {
+		confirmations = 0
+	}
+
+	// Build vin.
+	vins := make([]txVinResult, len(tx.TxIn))
+	for i, in := range tx.TxIn {
+		vin := txVinResult{
+			Sequence: in.Sequence,
+		}
+		if i == 0 && tx.TxIn[0].PreviousOutPoint.Hash == (chainhash.Hash{}) {
+			vin.Coinbase = hex.EncodeToString(in.SignatureScript)
+		} else {
+			vin.TxID = in.PreviousOutPoint.Hash.String()
+			vin.Vout = in.PreviousOutPoint.Index
+			vin.ScriptSig = &scriptSigResult{
+				Hex: hex.EncodeToString(in.SignatureScript),
+			}
+		}
+		if len(in.Witness) > 0 {
+			witness := make([]string, len(in.Witness))
+			for j, w := range in.Witness {
+				witness[j] = hex.EncodeToString(w)
+			}
+			vin.TxInWitness = witness
+		}
+		vins[i] = vin
+	}
+
+	// Build vout.
+	vouts := make([]txVoutResult, len(tx.TxOut))
+	for i, out := range tx.TxOut {
+		vouts[i] = txVoutResult{
+			Value: float64(out.Value) / 1e8,
+			N:     i,
+			ScriptPubKey: scriptPubKeyResult{
+				Hex:  hex.EncodeToString(out.PkScript),
+				Type: scriptType(out.PkScript),
+			},
+		}
+	}
+
+	// Compute wtxid (hash including witness).
+	var wtxBuf bytes.Buffer
+	tx.Serialize(&wtxBuf)
+	wtxHash := chainhash.DoubleHashH(wtxBuf.Bytes())
+
+	// Compute sizes.
+	size := tx.SerializeSize()
+	var noWitBuf bytes.Buffer
+	tx.SerializeNoWitness(&noWitBuf)
+	strippedSize := noWitBuf.Len()
+	weight := strippedSize*3 + size
+	vsize := (weight + 3) / 4
+
+	return rawTxVerboseResult{
+		Hex:           txHex,
+		TxID:          txid.String(),
+		Hash:          wtxHash.String(),
+		Size:          size,
+		VSize:         vsize,
+		Weight:        weight,
+		Version:       tx.Version,
+		LockTime:      tx.LockTime,
+		Vin:           vins,
+		Vout:          vouts,
+		BlockHash:     blockHash.String(),
+		Confirmations: confirmations,
+		BlockTime:     blockTime,
+		Time:          blockTime,
+	}, nil
+}
+
+// scriptType returns a basic classification of the output script type.
+func scriptType(pkScript []byte) string {
+	switch {
+	case len(pkScript) == 25 && pkScript[0] == 0x76 && pkScript[1] == 0xa9 &&
+		pkScript[2] == 0x14 && pkScript[23] == 0x88 && pkScript[24] == 0xac:
+		return "pubkeyhash"
+	case len(pkScript) == 23 && pkScript[0] == 0xa9 && pkScript[1] == 0x14 &&
+		pkScript[22] == 0x87:
+		return "scripthash"
+	case len(pkScript) == 22 && pkScript[0] == 0x00 && pkScript[1] == 0x14:
+		return "witness_v0_keyhash"
+	case len(pkScript) == 34 && pkScript[0] == 0x00 && pkScript[1] == 0x20:
+		return "witness_v0_scripthash"
+	case len(pkScript) == 34 && pkScript[0] == 0x51 && pkScript[1] == 0x20:
+		return "witness_v1_taproot"
+	case len(pkScript) == 35 && pkScript[34] == 0xac:
+		return "pubkey"
+	case len(pkScript) > 0 && pkScript[len(pkScript)-1] == 0xae:
+		return "multisig"
+	case len(pkScript) > 1 && pkScript[0] == 0x6a:
+		return "nulldata"
+	default:
+		return "nonstandard"
+	}
 }
 
 // getBlockHeaderVerboseResult matches Bitcoin Core's verbose getblockheader response.
